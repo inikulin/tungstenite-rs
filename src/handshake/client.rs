@@ -2,8 +2,9 @@
 
 use std::io::{Read, Write};
 use std::marker::PhantomData;
+use std::result::Result as StdResult;
 
-use http::{HeaderMap, Request as HttpRequest, Response as HttpResponse, StatusCode};
+use http::{HeaderMap, HeaderValue, Response as HttpResponse, StatusCode};
 use httparse::Status;
 use log::*;
 
@@ -14,7 +15,86 @@ use crate::error::{Error, Result};
 use crate::protocol::{Role, WebSocket, WebSocketConfig};
 
 /// Client request type.
-pub type Request = HttpRequest<()>;
+#[derive(Debug, Default)]
+pub struct Request {
+    method: http::Method,
+    uri: http::Uri,
+    version: http::Version,
+    headers: Vec<(String, HeaderValue)>,
+}
+
+/// Client header type. Preserves original case from httparse.
+pub type HeaderVec = Vec<(String, HeaderValue)>;
+
+/// Client header iterator.
+pub type HeaderIter<'a> = std::slice::Iter<'a, (String, HeaderValue)>;
+
+impl Request {
+    /// Creates a new Request from an http::Request.
+    pub fn from_http(req: http::Request<()>) -> Result<Self> {
+        let (parts, _) = req.into_parts();
+        Ok(Request {
+            method: parts.method,
+            version: parts.version,
+            uri: parts.uri,
+            headers: headers_from_http(parts.headers),
+        })
+    }
+
+    /// Creates a new Request initialized with a GET method and the given URI.
+    /// The version is HTTP/1.1 and there are no headers set.
+    pub fn get(uri: http::Uri) -> Self {
+        Request {
+            method: http::Method::GET,
+            version: http::Version::HTTP_11,
+            uri,
+            headers: vec![],
+        }
+    }
+
+    /// Returns a reference to the associated HTTP method.
+    pub fn method(&self) -> &http::Method {
+        &self.method
+    }
+
+    /// Returns a reference to the associated URI.
+    pub fn uri(&self) -> &http::Uri {
+        &self.uri
+    }
+
+    /// Returns the associated version.
+    pub fn version(&self) -> http::Version {
+        self.version
+    }
+
+    /// Returns a reference to the associated header names and values.
+    pub fn headers(&self) -> HeaderIter {
+        self.headers.iter()
+    }
+}
+
+fn headers_from_http(mut headers: HeaderMap) -> HeaderVec {
+    let mut last_header = None;
+    headers
+        .drain()
+        .map(|(name, value)| {
+            if let Some(name) = name {
+                last_header = Some(name);
+            }
+
+            (last_header.as_ref().unwrap().as_str().to_owned(), value)
+        })
+        .collect()
+}
+
+fn headers_from_httparse(
+    headers: &[httparse::Header],
+) -> StdResult<HeaderVec, http::header::InvalidHeaderValue> {
+    headers
+        .iter()
+        .map(|h| Ok((h.name.to_string(), HeaderValue::from_bytes(h.value)?)))
+        .collect()
+}
 
 /// Client response type.
 pub type Response = HttpResponse<()>;
@@ -146,7 +226,7 @@ fn generate_request(request: Request, key: &str) -> Result<Vec<u8>> {
 
     for (k, v) in request.headers() {
         let mut k = k.as_str();
-        if k == "sec-websocket-protocol" {
+        if k.eq_ignore_ascii_case("sec-websocket-protocol") {
             k = "Sec-WebSocket-Protocol";
         }
         writeln!(req, "{}: {}\r", k, v.to_str()?).unwrap();
@@ -258,6 +338,31 @@ impl<'h, 'b: 'h> FromHttparse<httparse::Response<'h, 'b>> for Response {
     }
 }
 
+impl<'h, 'b: 'h> FromHttparse<httparse::Request<'h, 'b>> for Request {
+    fn from_httparse(raw: httparse::Request<'h, 'b>) -> Result<Self> {
+        if raw.method.expect("Bug: no method in header") != "GET" {
+            return Err(Error::Protocol("Method is not GET".into()));
+        }
+
+        if raw.version.expect("Bug: no HTTP version") < /*1.*/1 {
+            return Err(Error::Protocol(
+                "HTTP version should be 1.1 or higher".into(),
+            ));
+        }
+
+        let headers = headers_from_httparse(raw.headers)?;
+
+        Ok(Request {
+            method: http::Method::GET,
+            uri: raw.path.expect("Bug: no path in header").parse()?,
+            // TODO: httparse only supports HTTP 0.9/1.0/1.1 but not HTTP 2.0
+            // so the only valid value we could get in the response would be 1.1.
+            version: http::Version::HTTP_11,
+            headers,
+        })
+    }
+}
+
 /// Generate a random key for the `Sec-WebSocket-Key` header.
 fn generate_key() -> String {
     // a base64-encoded (see Section 4 of [RFC4648]) value that,
@@ -268,7 +373,7 @@ fn generate_key() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::machine::TryParse;
+    use super::{super::machine::TryParse, headers_from_http};
     use super::{generate_key, generate_request, Response};
     use crate::client::IntoClientRequest;
 
@@ -290,7 +395,11 @@ mod tests {
 
     #[test]
     fn request_formatting() {
-        let request = "ws://localhost/getCaseCount".into_client_request().unwrap();
+        let mut request = "ws://localhost/getCaseCount".into_client_request().unwrap();
+        request.headers.push((
+            "User-Agent".into(),
+            http::HeaderValue::from_bytes(b"Test-Client").unwrap(),
+        ));
         let key = "A70tsIbeMZUbJHh5BWFw6Q==";
         let correct = b"\
             GET /getCaseCount HTTP/1.1\r\n\
@@ -299,6 +408,7 @@ mod tests {
             Upgrade: websocket\r\n\
             Sec-WebSocket-Version: 13\r\n\
             Sec-WebSocket-Key: A70tsIbeMZUbJHh5BWFw6Q==\r\n\
+            User-Agent: Test-Client\r\n\
             \r\n";
         let request = generate_request(request, key).unwrap();
         println!("Request: {}", String::from_utf8_lossy(&request));
@@ -351,6 +461,24 @@ mod tests {
         assert_eq!(
             resp.headers().get("Content-Type").unwrap(),
             &b"text/html"[..],
+        );
+    }
+
+    #[test]
+    fn test_headers_from_http() {
+        let mut header_map = http::HeaderMap::new();
+        header_map.insert(http::header::HOST, "example.com".parse().unwrap());
+        header_map.append(http::header::COOKIE, "a=b".parse().unwrap());
+        header_map.append(http::header::COOKIE, "c=d".parse().unwrap());
+        header_map.insert("Custom", "test".parse().unwrap());
+        assert_eq!(
+            headers_from_http(header_map),
+            vec![
+                ("host".to_owned(), "example.com".parse().unwrap()),
+                ("cookie".to_owned(), "a=b".parse().unwrap()),
+                ("cookie".to_owned(), "c=d".parse().unwrap()),
+                ("custom".to_owned(), "test".parse().unwrap()),
+            ]
         );
     }
 }

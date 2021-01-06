@@ -222,7 +222,7 @@ impl<'a> IntoClientRequest for &'a Uri {
 
 impl IntoClientRequest for Uri {
     fn into_client_request(self) -> Result<Request> {
-        Ok(Request::get(self).body(())?)
+        Ok(Request::get(self))
     }
 }
 
@@ -238,9 +238,9 @@ impl IntoClientRequest for Url {
     }
 }
 
-impl IntoClientRequest for Request {
+impl IntoClientRequest for http::Request<()> {
     fn into_client_request(self) -> Result<Request> {
-        Ok(self)
+        Request::from_http(self)
     }
 }
 
@@ -248,5 +248,11 @@ impl<'h, 'b> IntoClientRequest for httparse::Request<'h, 'b> {
     fn into_client_request(self) -> Result<Request> {
         use crate::handshake::headers::FromHttparse;
         Request::from_httparse(self)
+    }
+}
+
+impl IntoClientRequest for Request {
+    fn into_client_request(self) -> Result<Request> {
+        Ok(self)
     }
 }
